@@ -127,6 +127,27 @@ func (r *TaskRepository) MarkFailed(ctx context.Context, id int, errMsg string, 
 	return nil
 }
 
+// MarkFailedTerminal moves a task straight to the terminal 'failed' state
+// regardless of attempts/max_retries. Used when retrying makes no sense
+// (unknown task type, malformed payload, validation failure).
+func (r *TaskRepository) MarkFailedTerminal(ctx context.Context, id int, errMsg string) error {
+	cmd, err := r.pool.Exec(ctx, `
+		UPDATE tasks
+		SET attempts = attempts + 1,
+		    last_error = $2,
+		    status = 'failed',
+		    updated_at = NOW()
+		WHERE id = $1
+	`, id, errMsg)
+	if err != nil {
+		return fmt.Errorf("mark failed terminal: %w", err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *TaskRepository) FindByID(ctx context.Context, id int) (*model.Task, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at

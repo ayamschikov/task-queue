@@ -366,6 +366,46 @@ func TestMarkFailed_notFound(t *testing.T) {
 	}
 }
 
+func TestMarkFailedTerminal(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+	ctx := context.Background()
+
+	// MaxRetries deliberately high — terminal must override retry semantics.
+	tsk, err := repo.Enqueue(ctx, EnqueueParams{Type: "x", Payload: json.RawMessage(`{}`), MaxRetries: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.MarkFailedTerminal(ctx, tsk.ID, "no handler"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.FindByID(ctx, tsk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("status: got %q want failed", got.Status)
+	}
+	if got.LastError == nil || *got.LastError != "no handler" {
+		t.Errorf("last_error: got %v want 'no handler'", got.LastError)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("attempts: got %d want 1", got.Attempts)
+	}
+}
+
+func TestMarkFailedTerminal_notFound(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+
+	err := repo.MarkFailedTerminal(context.Background(), 999_999, "no handler")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err: got %v want ErrNotFound", err)
+	}
+}
+
 func TestFindByID_notFound(t *testing.T) {
 	resetDB(t)
 	repo := NewTaskRepository(testPool)
