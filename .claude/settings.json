@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"exe/taskqueue\")",
+      "Bash(pkill -f \"go run ./cmd/taskqueue\")"
+    ]
+  }
+}
