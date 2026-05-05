@@ -98,6 +98,8 @@ func run() error {
 		return nil
 	})
 
+	sweeper := worker.NewSweeper(taskRepo, worker.SweepConfig{Logger: slog.Default()})
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -117,12 +119,16 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		slog.Info("worker pool starting", "size", cfg.workerPoolSize)
 		workerPool.Run(ctx)
 		slog.Info("worker pool stopped")
+	}()
+	go func() {
+		defer wg.Done()
+		sweeper.Run(ctx)
 	}()
 
 	serverErr := make(chan error, 1)

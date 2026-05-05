@@ -26,4 +26,5 @@ type Task struct {
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 	ScheduledAt time.Time       `json:"scheduled_at"`
+	PickedAt    *time.Time      `json:"picked_at,omitempty"`
 }

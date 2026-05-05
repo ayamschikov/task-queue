@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -66,14 +67,23 @@ func runIntegrationTests(m *testing.M) (int, error) {
 }
 
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	sqlBytes, err := os.ReadFile(filepath.Join("..", "..", "migrations", "00001_create_tasks.sql"))
+	matches, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
 	if err != nil {
 		return err
 	}
-	// Take everything before the Down marker so we don't drop the table we just created.
-	upSQL := strings.Split(string(sqlBytes), "-- +goose Down")[0]
-	_, err = pool.Exec(ctx, upSQL)
-	return err
+	sort.Strings(matches)
+	for _, m := range matches {
+		sqlBytes, err := os.ReadFile(m)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", m, err)
+		}
+		// Take everything before the Down marker so we don't undo what we just applied.
+		upSQL := strings.Split(string(sqlBytes), "-- +goose Down")[0]
+		if _, err := pool.Exec(ctx, upSQL); err != nil {
+			return fmt.Errorf("apply %s: %w", m, err)
+		}
+	}
+	return nil
 }
 
 func resetDB(t *testing.T) {
@@ -136,6 +146,12 @@ func TestPickPending_flipsToRunning(t *testing.T) {
 	}
 	if tasks[0].Status != model.TaskStatusRunning {
 		t.Errorf("status: got %q want running", tasks[0].Status)
+	}
+	// picked_at must be set; tolerate clock skew between host and container.
+	if tasks[0].PickedAt == nil {
+		t.Error("picked_at: got nil want set")
+	} else if elapsed := time.Since(*tasks[0].PickedAt); elapsed < -5*time.Second || elapsed > 30*time.Second {
+		t.Errorf("picked_at: got %v, expected within recent window (elapsed=%v)", tasks[0].PickedAt, elapsed)
 	}
 }
 
@@ -404,6 +420,139 @@ func TestMarkFailedTerminal_notFound(t *testing.T) {
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err: got %v want ErrNotFound", err)
 	}
+}
+
+func TestRecoverStuck_returnsToPending(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+	ctx := context.Background()
+
+	// Insert directly with picked_at in the past so the row looks stuck.
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO tasks (type, payload, status, picked_at, max_retries)
+		VALUES ($1, $2, 'running', NOW() - INTERVAL '10 minutes', 5)
+	`, "x", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := repo.RecoverStuck(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("recovered: got %d want 1", n)
+	}
+
+	got, err := selectFirst(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusPending {
+		t.Errorf("status: got %q want pending", got.Status)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("attempts: got %d want 1", got.Attempts)
+	}
+	if got.PickedAt != nil {
+		t.Errorf("picked_at: got %v want nil (cleared on recovery)", got.PickedAt)
+	}
+	if got.LastError == nil || *got.LastError != "stuck task recovery" {
+		t.Errorf("last_error: got %v want 'stuck task recovery'", got.LastError)
+	}
+}
+
+func TestRecoverStuck_terminalAfterMaxRetries(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+	ctx := context.Background()
+
+	// attempts=2, max_retries=3 → next recovery hits the cap and goes terminal.
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO tasks (type, payload, status, picked_at, attempts, max_retries)
+		VALUES ($1, $2, 'running', NOW() - INTERVAL '10 minutes', 2, 3)
+	`, "x", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repo.RecoverStuck(ctx, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := selectFirst(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusFailed {
+		t.Errorf("status: got %q want failed (DLQ)", got.Status)
+	}
+	if got.Attempts != 3 {
+		t.Errorf("attempts: got %d want 3", got.Attempts)
+	}
+}
+
+func TestRecoverStuck_skipsRecentlyPicked(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+	ctx := context.Background()
+
+	// picked_at = NOW() — well within threshold.
+	tsk, err := repo.Enqueue(ctx, EnqueueParams{Type: "x", Payload: json.RawMessage(`{}`), MaxRetries: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.PickPending(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := repo.RecoverStuck(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("recovered: got %d want 0 (recent picks should not be recovered)", n)
+	}
+
+	got, err := repo.FindByID(ctx, tsk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.TaskStatusRunning {
+		t.Errorf("status: got %q want running (untouched)", got.Status)
+	}
+}
+
+func TestRecoverStuck_skipsNonRunning(t *testing.T) {
+	resetDB(t)
+	repo := NewTaskRepository(testPool)
+	ctx := context.Background()
+
+	// pending row with old picked_at (e.g., previously processed and re-queued).
+	// Should not be recovered because status != 'running'.
+	_, err := testPool.Exec(ctx, `
+		INSERT INTO tasks (type, payload, status, picked_at)
+		VALUES ($1, $2, 'pending', NOW() - INTERVAL '10 minutes')
+	`, "x", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := repo.RecoverStuck(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("recovered: got %d want 0", n)
+	}
+}
+
+// selectFirst returns the only row in tasks for a single-row test setup.
+func selectFirst(ctx context.Context) (*model.Task, error) {
+	row := testPool.QueryRow(ctx, `
+		SELECT id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at, picked_at
+		FROM tasks ORDER BY id LIMIT 1`)
+	return scanTask(row)
 }
 
 func TestFindByID_notFound(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,13 +68,22 @@ func runIntegrationTests(m *testing.M) (int, error) {
 }
 
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	sqlBytes, err := os.ReadFile(filepath.Join("..", "..", "migrations", "00001_create_tasks.sql"))
+	matches, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
 	if err != nil {
 		return err
 	}
-	upSQL := strings.Split(string(sqlBytes), "-- +goose Down")[0]
-	_, err = pool.Exec(ctx, upSQL)
-	return err
+	sort.Strings(matches)
+	for _, m := range matches {
+		sqlBytes, err := os.ReadFile(m)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", m, err)
+		}
+		upSQL := strings.Split(string(sqlBytes), "-- +goose Down")[0]
+		if _, err := pool.Exec(ctx, upSQL); err != nil {
+			return fmt.Errorf("apply %s: %w", m, err)
+		}
+	}
+	return nil
 }
 
 func resetDB(t *testing.T) {

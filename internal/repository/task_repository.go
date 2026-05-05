@@ -34,7 +34,7 @@ func (r *TaskRepository) Enqueue(ctx context.Context, p EnqueueParams) (*model.T
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO tasks (type, payload, priority, max_retries)
 		VALUES ($1, $2, $3, $4)
-		RETURNING id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at`,
+		RETURNING id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at, picked_at`,
 		p.Type, p.Payload, p.Priority, p.MaxRetries,
 	)
 	t, err := scanTask(row)
@@ -58,10 +58,10 @@ func (r *TaskRepository) PickPending(ctx context.Context, limit int) ([]*model.T
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE tasks t
-		SET status = 'running', updated_at = NOW()
+		SET status = 'running', picked_at = NOW(), updated_at = NOW()
 		FROM picked
 		WHERE t.id = picked.id
-		RETURNING t.id, t.type, t.payload, t.status, t.priority, t.attempts, t.max_retries, t.last_error, t.created_at, t.updated_at, t.scheduled_at`,
+		RETURNING t.id, t.type, t.payload, t.status, t.priority, t.attempts, t.max_retries, t.last_error, t.created_at, t.updated_at, t.scheduled_at, t.picked_at`,
 		limit,
 	)
 	if err != nil {
@@ -148,9 +148,42 @@ func (r *TaskRepository) MarkFailedTerminal(ctx context.Context, id int, errMsg 
 	return nil
 }
 
+// RecoverStuck returns to 'pending' (or moves to terminal 'failed') every task
+// that has been in 'running' for longer than `threshold`. Such rows mean a
+// worker crashed mid-flight or was killed before it could write a result —
+// without recovery they would never be picked up again. Returns the number of
+// rows recovered.
+//
+// Recovery counts as one attempt. The trade-off: a host failure costs one
+// retry slot, but a poison task that consistently crashes the worker can't
+// loop forever — it eventually hits max_retries and lands in DLQ.
+func (r *TaskRepository) RecoverStuck(ctx context.Context, threshold time.Duration) (int, error) {
+	cutoff := time.Now().Add(-threshold)
+	cmd, err := r.pool.Exec(ctx, `
+		UPDATE tasks
+		SET attempts = attempts + 1,
+		    last_error = 'stuck task recovery',
+		    status = CASE
+		        WHEN attempts + 1 >= max_retries THEN 'failed'
+		        ELSE 'pending'
+		    END,
+		    picked_at = NULL,
+		    scheduled_at = CASE
+		        WHEN attempts + 1 >= max_retries THEN scheduled_at
+		        ELSE NOW()
+		    END,
+		    updated_at = NOW()
+		WHERE status = 'running' AND picked_at < $1
+	`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("recover stuck: %w", err)
+	}
+	return int(cmd.RowsAffected()), nil
+}
+
 func (r *TaskRepository) FindByID(ctx context.Context, id int) (*model.Task, error) {
 	row := r.pool.QueryRow(ctx, `
-		SELECT id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at
+		SELECT id, type, payload, status, priority, attempts, max_retries, last_error, created_at, updated_at, scheduled_at, picked_at
 		FROM tasks WHERE id = $1`, id)
 	t, err := scanTask(row)
 	if err != nil {
@@ -167,7 +200,7 @@ func scanTask(row pgx.Row) (*model.Task, error) {
 	if err := row.Scan(
 		&t.ID, &t.Type, &t.Payload, &t.Status, &t.Priority,
 		&t.Attempts, &t.MaxRetries, &t.LastError,
-		&t.CreatedAt, &t.UpdatedAt, &t.ScheduledAt,
+		&t.CreatedAt, &t.UpdatedAt, &t.ScheduledAt, &t.PickedAt,
 	); err != nil {
 		return nil, err
 	}
