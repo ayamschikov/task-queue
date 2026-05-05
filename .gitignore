@@ -1,0 +1,6 @@
+.env
+/taskqueue
+*.test
+.idea/
+.vscode/
+.DS_Store
