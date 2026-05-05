@@ -15,6 +15,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ayamschikov/task-queue/internal/handler"
+	"github.com/ayamschikov/task-queue/internal/repository"
+	"github.com/ayamschikov/task-queue/internal/service"
 )
 
 type config struct {
@@ -78,6 +82,10 @@ func run() error {
 	}
 	slog.Info("db connected")
 
+	taskRepo := repository.NewTaskRepository(pool)
+	taskSvc := service.NewTaskService(taskRepo)
+	taskHandler := handler.NewTaskHandler(taskSvc)
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -88,6 +96,7 @@ func run() error {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
+	taskHandler.Routes(r)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.port,
