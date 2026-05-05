@@ -104,7 +104,9 @@ func (p *Pool) loop(ctx context.Context, id int) {
 			return
 		}
 
+		pollStart := time.Now()
 		tasks, err := p.repo.PickPending(ctx, 1)
+		pollLatency := time.Since(pollStart)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -123,8 +125,9 @@ func (p *Pool) loop(ctx context.Context, id int) {
 
 		// Found work — reset polling interval so the next idle period starts fresh.
 		pollDelay = p.cfg.MinPoll
+		pickedAt := time.Now()
 		for _, t := range tasks {
-			p.process(ctx, t, log)
+			p.process(ctx, t, log, pollLatency, pickedAt)
 		}
 	}
 }
@@ -134,29 +137,32 @@ func (p *Pool) loop(ctx context.Context, id int) {
 // in 'running' after its handler already finished.
 const writeResultTimeout = 5 * time.Second
 
-func (p *Pool) process(ctx context.Context, t *model.Task, log *slog.Logger) {
+func (p *Pool) process(ctx context.Context, t *model.Task, log *slog.Logger, pollLatency time.Duration, pickedAt time.Time) {
 	handler, ok := p.handlers[t.Type]
 	if !ok {
 		msg := fmt.Sprintf("no handler registered for type %q", t.Type)
 		log.Error("unknown task type", "id", t.ID, "type", t.Type)
 		writeCtx, cancel := context.WithTimeout(context.Background(), writeResultTimeout)
 		defer cancel()
+		writeStart := time.Now()
 		if err := p.repo.MarkFailedTerminal(writeCtx, t.ID, msg); err != nil {
 			log.Error("mark failed terminal", "id", t.ID, "err", err)
 		}
+		logCompletion(log, t, "terminal", pollLatency, pickedAt, time.Time{}, time.Time{}, writeStart)
 		return
 	}
 
+	handlerStart := time.Now()
 	err := handler(ctx, t.Payload)
+	handlerEnd := time.Now()
 
 	writeCtx, cancel := context.WithTimeout(context.Background(), writeResultTimeout)
 	defer cancel()
+	writeStart := time.Now()
 
 	if err != nil {
 		// If shutdown raced with the handler we don't penalize the task — it
-		// stays 'running' and a future stuck-task sweep will recover it.
-		// (The sweep is not implemented yet; until then, a crash mid-flight
-		// strands the row.)
+		// stays 'running' and a future stuck-task sweep recovers it.
 		if errors.Is(err, context.Canceled) {
 			log.Warn("task interrupted by shutdown", "id", t.ID)
 			return
@@ -165,11 +171,34 @@ func (p *Pool) process(ctx context.Context, t *model.Task, log *slog.Logger) {
 		if markErr := p.repo.MarkFailed(writeCtx, t.ID, err.Error(), backoff); markErr != nil {
 			log.Error("mark failed", "id", t.ID, "err", markErr)
 		}
+		logCompletion(log, t, "failed", pollLatency, pickedAt, handlerStart, handlerEnd, writeStart)
 		return
 	}
 	if err := p.repo.MarkDone(writeCtx, t.ID); err != nil {
 		log.Error("mark done", "id", t.ID, "err", err)
 	}
+	logCompletion(log, t, "done", pollLatency, pickedAt, handlerStart, handlerEnd, writeStart)
+}
+
+// logCompletion emits one structured event per processed task with all the
+// per-stage timings. Zero-valued handlerStart/handlerEnd indicate the unknown-
+// handler path (no handler ran).
+func logCompletion(log *slog.Logger, t *model.Task, status string, pollLatency time.Duration, pickedAt, handlerStart, handlerEnd, writeStart time.Time) {
+	now := time.Now()
+	attrs := []slog.Attr{
+		slog.Int("task_id", t.ID),
+		slog.String("type", t.Type),
+		slog.String("result", status),
+		slog.Int("attempts", t.Attempts),
+		slog.Duration("wait_in_queue", pickedAt.Sub(t.ScheduledAt)),
+		slog.Duration("poll_latency", pollLatency),
+		slog.Duration("write_latency", now.Sub(writeStart)),
+		slog.Duration("total", now.Sub(pickedAt)),
+	}
+	if !handlerStart.IsZero() {
+		attrs = append(attrs, slog.Duration("handler_duration", handlerEnd.Sub(handlerStart)))
+	}
+	log.LogAttrs(context.Background(), slog.LevelInfo, "task completed", attrs...)
 }
 
 // computeBackoff returns base * 2^attempts with up to +20% jitter, capped at max.
