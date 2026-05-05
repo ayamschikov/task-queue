@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/ayamschikov/task-queue/internal/handler"
 	"github.com/ayamschikov/task-queue/internal/repository"
 	"github.com/ayamschikov/task-queue/internal/service"
+	"github.com/ayamschikov/task-queue/internal/worker"
 )
 
 type config struct {
@@ -86,6 +89,15 @@ func run() error {
 	taskSvc := service.NewTaskService(taskRepo)
 	taskHandler := handler.NewTaskHandler(taskSvc)
 
+	workerPool := worker.New(taskRepo, worker.Config{
+		Size:   cfg.workerPoolSize,
+		Logger: slog.Default(),
+	})
+	workerPool.Register("echo", func(_ context.Context, payload json.RawMessage) error {
+		slog.Info("echo handler", "payload", string(payload))
+		return nil
+	})
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -103,6 +115,15 @@ func run() error {
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		slog.Info("worker pool starting", "size", cfg.workerPoolSize)
+		workerPool.Run(ctx)
+		slog.Info("worker pool stopped")
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -124,6 +145,10 @@ func run() error {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("server shutdown: %w", err)
 	}
+
+	// ctx is already cancelled at this point — workers are draining.
+	wg.Wait()
+
 	slog.Info("shutdown complete")
 	return nil
 }
